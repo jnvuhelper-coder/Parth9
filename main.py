@@ -3,45 +3,32 @@ import os
 import nest_asyncio
 import fitz  # PyMuPDF
 import re
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from playwright.async_api import async_playwright
 
 nest_asyncio.apply()
 
-# Environment Variable से टोकन लेना (Render के लिए सुरक्षित)
+# --- डमी सर्वर (Render की Port Error ठीक करने के लिए) ---
+def run_dummy_server():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is active and running!")
+
+    # Render अपने आप PORT एनवायरनमेंट वेरिएबल देता है
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), Handler)
+    print(f"Dummy server started on port {port}")
+    server.serve_forever()
+
+# --- एडमिट कार्ड लॉजिक (पुराना वाला ही है) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 browser_instance = None
 playwright_instance = None
-
-def extract_student_info(pdf_path):
-    info = {"name": "Not Found", "father": "Not Found", "mother": "Not Found", 
-            "email": "Not Found", "abc_id": "Not Found", "roll": "Not Found", 
-            "college": "Not Found", "center": "Not Found"}
-    try:
-        doc = fitz.open(pdf_path)
-        text = "".join([page.get_text() for page in doc])
-        
-        roll_match = re.search(r"Roll no is\s+([\w\d]+)", text)
-        if roll_match: info["roll"] = roll_match.group(1).strip()
-
-        name_match = re.search(r"NAME OF CANDIDATE\s*:\s*(.*)", text)
-        if name_match: info["name"] = name_match.group(1).split('\n')[0].strip()
-
-        father_match = re.search(r"FATHER'S NAME\s*:\s*(.*)", text)
-        if father_match: info["father"] = father_match.group(1).split('\n')[0].strip()
-
-        college_match = re.search(r"COLLEGE NAME\s*:\s*(.*)", text)
-        if college_match: info["college"] = college_match.group(1).split('\n')[0].strip()
-
-        center_pattern = r"Exam Centre is\s*(.*?)(?=Print Date|To,|The Centre|NAME OF EXAMINATION)"
-        center_match = re.search(center_pattern, text, re.DOTALL)
-        if center_match: info["center"] = " ".join(center_match.group(1).split())
-
-        doc.close()
-        return info
-    except Exception:
-        return info
 
 async def get_browser():
     global browser_instance, playwright_instance
@@ -70,10 +57,44 @@ async def download_jnvu_pdf(form_number):
         await context.close()
         return pdf_path
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Download Error: {e}")
         await context.close()
         return None
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text.strip()
+    if not user_input.isdigit():
+        await update.message.reply_text("❌ कृपया केवल Form Number भेजें।")
+        return
+
+    status = await update.message.reply_text("⏳ एडमिट कार्ड लोड हो रहा है...")
+    file_path = await download_jnvu_pdf(user_input)
+
+    if file_path and os.path.exists(file_path):
+        # यहाँ आप चाहें तो PDF से डेटा निकालने वाला फंक्शन डाल सकते हैं
+        await update.message.reply_document(document=open(file_path, 'rb'), caption="✅ एडमिट कार्ड मिल गया!")
+        os.remove(file_path)
+        await status.delete()
+    else:
+        await status.edit_text("❌ एडमिट कार्ड नहीं मिला।")
+
+async def main():
+    if not BOT_TOKEN:
+        print("BOT_TOKEN missing!")
+        return
+        
+    # डमी सर्वर को अलग धागे (Thread) में शुरू करें
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("नमस्ते! अपना Form Number भेजें।")))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    
+    print("✅ बॉट और डमी सर्वर लाइव हैं...")
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = update.message.text.strip()
     if not user_input.isdigit():

@@ -75,6 +75,82 @@ async def get_browser():
 # --- डाउनलोड लॉजिक ---
 async def download_jnvu_pdf(form_number):
     pdf_path = f"admit_card_{form_number}.pdf"
+    try:
+        browser = await get_browser()  # यह अब async फंक्शन के अंदर है
+        context = await browser.new_context(accept_downloads=True)
+        page = await context.new_page()
+        
+        url = "https://erp.jnvuiums.in/(S(biolzjtwlrcfmzwwzgs5uj5n))/Exam/Pre_Exam/Exam_ForALL_AdmitCard.aspx#"
+        
+        await page.goto(url, wait_until="load", timeout=60000)
+        await page.fill("#txtchallanNo", str(form_number))
+        
+        async with page.expect_download(timeout=30000) as download_info:
+            await page.click("#btnGetResult")
+        
+        download = await download_info.value
+        await download.save_as(pdf_path)
+        await context.close()
+        return pdf_path
+    except Exception as e:
+        print(f"Download Error: {e}")
+        return None
+
+# --- टेलीग्राम मैसेज हैंडलर ---
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text.strip()
+    if not user_input.isdigit():
+        await update.message.reply_text("❌ कृपया केवल Form Number भेजें।")
+        return
+
+    status_msg = await update.message.reply_text("⚡ एडमिट कार्ड लोड हो रहा है...")
+    file_path = await download_jnvu_pdf(user_input)
+
+    if file_path and os.path.exists(file_path):
+        data = extract_student_info(file_path)
+        caption = (
+            f"✅ **Admit Card Found!**\n\n"
+            f"👤 **Name:** `{data['name']}`\n"
+            f"👨‍💼 **Father:** `{data['father']}`\n"
+            f"🏫 **Center:**\n`{data['center']}`"
+        )
+        try:
+            with open(file_path, 'rb') as doc:
+                await update.message.reply_document(document=doc, caption=caption, parse_mode='Markdown')
+            os.remove(file_path)
+            await status_msg.delete()
+        except Exception as e:
+            await status_msg.edit_text(f"❌ त्रुटि: {e}")
+    else:
+        await status_msg.edit_text("❌ एडमिट कार्ड नहीं मिला।")
+
+# --- बॉट रनर (New Async Method) ---
+async def run_bot():
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("नमस्ते! अपना Form Number भेजें।")))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    
+    await application.initialize()
+    await application.updater.start_polling()
+    await application.start()
+    
+    print("✅ Telegram Bot Started & Polling...")
+    
+    while True:
+        await asyncio.sleep(3600)
+
+if __name__ == "__main__":
+    # FastAPI को अलग थ्रेड में शुरू करें
+    threading.Thread(target=run_fastapi, daemon=True).start()
+    
+    # बॉट को मुख्य लूप में चलाएं
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(run_bot())
+    except KeyboardInterrupt:
+        pass
+    pdf_path = f"admit_card_{form_number}.pdf"
     browser = await get_browser()
     context = await browser.new_context(accept_downloads=True)
     page = await context.new_page()

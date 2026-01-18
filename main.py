@@ -1,79 +1,138 @@
 import asyncio
 import os
-import nest_asyncio
-import fitz  # PyMuPDF
 import re
-from fastapi import FastAPI
+import threading
+import fitz  # PyMuPDF
 import uvicorn
+import nest_asyncio
+from fastapi import FastAPI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from playwright.async_api import async_playwright
 
 nest_asyncio.apply()
 
-# --- 1. FastAPI Setup ---
+# --- 1. Configurations ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 app = FastAPI()
+browser_instance = None
+playwright_instance = None
 
+# --- 2. FastAPI Setup ---
 @app.get("/")
 async def home():
     return {"status": "Bot is Running", "server": "FastAPI + Telegram"}
 
-# --- 2. JNVU Logic ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7936101320:AAGTHSCteVyYUzPb-snNWXDn9MxQDZUXs1M")
+def run_fastapi():
+    config = uvicorn.Config(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    server = uvicorn.Server(config)
+    server.run()
+
+# --- 3. Browser Management ---
+async def get_browser():
+    global browser_instance, playwright_instance
+    if browser_instance is None:
+        playwright_instance = await async_playwright().start()
+        browser_instance = await playwright_instance.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        )
+    return browser_instance
+
+# --- 4. Logic Functions ---
+def extract_student_info(pdf_path):
+    info = {"name": "N/A", "father": "N/A", "center": "N/A"}
+    try:
+        doc = fitz.open(pdf_path)
+        text = "".join([page.get_text() for page in doc])
+        
+        name_match = re.search(r"NAME OF CANDIDATE\s*:\s*(.*)", text)
+        if name_match: info["name"] = name_match.group(1).split('\n')[0].strip()
+
+        father_match = re.search(r"FATHER'S NAME\s*:\s*(.*)", text)
+        if father_match: info["father"] = father_match.group(1).split('\n')[0].strip()
+
+        center_pattern = r"Exam Centre is\s*(.*?)(?=Print Date|To,|The Centre|NAME OF EXAMINATION)"
+        center_match = re.search(center_pattern, text, re.DOTALL)
+        if center_match: info["center"] = " ".join(center_match.group(1).split())
+
+        doc.close()
+    except Exception as e:
+        print(f"Extraction Error: {e}")
+    return info
 
 async def download_jnvu_pdf(form_number):
     pdf_path = f"admit_card_{form_number}.pdf"
     try:
-        async with async_playwright() as p:
-            # Render के लिए ज़रूरी Arguments
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-            context = await browser.new_context(accept_downloads=True)
-            page = await context.new_page()
-            
-            url = "https://erp.jnvuiums.in/(S(biolzjtwlrcfmzwwzgs5uj5n))/Exam/Pre_Exam/Exam_ForALL_AdmitCard.aspx#"
-            await page.goto(url, timeout=60000)
-            await page.fill("#txtchallanNo", str(form_number))
-            
-            async with page.expect_download(timeout=30000) as download_info:
-                await page.click("#btnGetResult")
-            
-            download = await download_info.value
-            await download.save_as(pdf_path)
-            await browser.close()
-            return pdf_path
+        browser = await get_browser()
+        context = await browser.new_context(accept_downloads=True)
+        page = await context.new_page()
+        
+        url = "https://erp.jnvuiums.in/(S(biolzjtwlrcfmzwwzgs5uj5n))/Exam/Pre_Exam/Exam_ForALL_AdmitCard.aspx#"
+        await page.goto(url, wait_until="load", timeout=60000)
+        await page.fill("#txtchallanNo", str(form_number))
+        
+        async with page.expect_download(timeout=30000) as download_info:
+            await page.click("#btnGetResult")
+        
+        download = await download_info.value
+        await download.save_as(pdf_path)
+        await context.close()
+        return pdf_path
     except Exception as e:
         print(f"Download Error: {e}")
         return None
 
-def extract_student_info(pdf_path):
-    info = {"name": "Not Found", "center": "Not Found"}
-    try:
-        doc = fitz.open(pdf_path)
-        text = "".join([page.get_text() for page in doc])
-        name_match = re.search(r"NAME OF CANDIDATE\s*:\s*(.*)", text)
-        if name_match:
-            info["name"] = name_match.group(1).split('\n')[0].strip()
-        doc.close()
-    except:
-        pass
-    return info
-
+# --- 5. Telegram Handlers ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_input = update.message.text.strip()
-    if user_input.isdigit():
-        status_msg = await update.message.reply_text("⚡ एडमिट कार्ड डाउनलोड हो रहा है...")
-        file_path = await download_jnvu_pdf(user_input)
-        
-        if file_path and os.path.exists(file_path):
-            data = extract_student_info(file_path)
-            caption = f"✅ **Admit Card Found!**\n👤 **Name:** `{data['name']}`"
-            
-            with open(file_path, 'rb') as doc:
-                await update.message.reply_document(document=doc, caption=caption, parse_mode='Markdown')
-            
-            os.remove(file_path)
-            await status_msg.delete()
-        else:
+    if not user_input.isdigit():
+        await update.message.reply_text("❌ कृपया केवल Form Number भेजें।")
+        return
+
+    status_msg = await update.message.reply_text("⚡ एडमिट कार्ड डाउनलोड हो रहा है...")
+    file_path = await download_jnvu_pdf(user_input)
+
+    if file_path and os.path.exists(file_path):
+        data = extract_student_info(file_path)
+        caption = (
+            f"✅ **Admit Card Found!**\n\n"
+            f"👤 **Name:** `{data['name']}`\n"
+            f"👨‍💼 **Father:** `{data['father']}`\n"
+            f"🏫 **Center:**\n`{data['center']}`"
+        )
+        with open(file_path, 'rb') as doc:
+            await update.message.reply_document(document=doc, caption=caption, parse_mode='Markdown')
+        os.remove(file_path)
+        await status_msg.delete()
+    else:
+        await status_msg.edit_text("❌ एडमिट कार्ड नहीं मिला। कृपया Form Number चेक करें।")
+
+# --- 6. Main Runner ---
+async def main():
+    # Start FastAPI in a separate thread
+    threading.Thread(target=run_fastapi, daemon=True).start()
+
+    # Build and Start Telegram Bot
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("नमस्ते! अपना Form Number भेजें।")))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    
+    print("🚀 Server and Bot are LIVE!")
+    
+    # Keep the event loop running
+    while True:
+        await asyncio.sleep(3600)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Stopping...")
             await status_msg.edit_text("❌ एडमिट कार्ड नहीं मिला।")
 
 # --- 3. Unified Runner (FastAPI + Bot) ---

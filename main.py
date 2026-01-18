@@ -3,7 +3,6 @@ import os
 import nest_asyncio
 import fitz  # PyMuPDF
 import re
-import threading
 from fastapi import FastAPI
 import uvicorn
 from telegram import Update
@@ -12,28 +11,91 @@ from playwright.async_api import async_playwright
 
 nest_asyncio.apply()
 
-# --- FastAPI सर्वर सेटअप ---
+# --- 1. FastAPI Setup ---
 app = FastAPI()
 
 @app.get("/")
-def read_root():
-    return {"status": "Bot is running", "server": "FastAPI"}
+async def home():
+    return {"status": "Bot is Running", "server": "FastAPI + Telegram"}
 
-def run_fastapi():
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
-# --- कॉन्फ़िगरेशन ---
+# --- 2. JNVU Logic ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7936101320:AAGTHSCteVyYUzPb-snNWXDn9MxQDZUXs1M")
-browser_instance = None
-playwright_instance = None
 
-# --- PDF विश्लेषण लॉजिक ---
+async def download_jnvu_pdf(form_number):
+    pdf_path = f"admit_card_{form_number}.pdf"
+    try:
+        async with async_playwright() as p:
+            # Render के लिए ज़रूरी Arguments
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+            context = await browser.new_context(accept_downloads=True)
+            page = await context.new_page()
+            
+            url = "https://erp.jnvuiums.in/(S(biolzjtwlrcfmzwwzgs5uj5n))/Exam/Pre_Exam/Exam_ForALL_AdmitCard.aspx#"
+            await page.goto(url, timeout=60000)
+            await page.fill("#txtchallanNo", str(form_number))
+            
+            async with page.expect_download(timeout=30000) as download_info:
+                await page.click("#btnGetResult")
+            
+            download = await download_info.value
+            await download.save_as(pdf_path)
+            await browser.close()
+            return pdf_path
+    except Exception as e:
+        print(f"Download Error: {e}")
+        return None
+
 def extract_student_info(pdf_path):
-    info = {
-        "name": "Not Found", "father": "Not Found", "mother": "Not Found",
-        "email": "Not Found", "abc_id": "Not Found", "roll": "Not Found",
-        "college": "Not Found", "center": "Not Found"
+    info = {"name": "Not Found", "center": "Not Found"}
+    try:
+        doc = fitz.open(pdf_path)
+        text = "".join([page.get_text() for page in doc])
+        name_match = re.search(r"NAME OF CANDIDATE\s*:\s*(.*)", text)
+        if name_match:
+            info["name"] = name_match.group(1).split('\n')[0].strip()
+        doc.close()
+    except:
+        pass
+    return info
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text.strip()
+    if user_input.isdigit():
+        status_msg = await update.message.reply_text("⚡ एडमिट कार्ड डाउनलोड हो रहा है...")
+        file_path = await download_jnvu_pdf(user_input)
+        
+        if file_path and os.path.exists(file_path):
+            data = extract_student_info(file_path)
+            caption = f"✅ **Admit Card Found!**\n👤 **Name:** `{data['name']}`"
+            
+            with open(file_path, 'rb') as doc:
+                await update.message.reply_document(document=doc, caption=caption, parse_mode='Markdown')
+            
+            os.remove(file_path)
+            await status_msg.delete()
+        else:
+            await status_msg.edit_text("❌ एडमिट कार्ड नहीं मिला।")
+
+# --- 3. Unified Runner (FastAPI + Bot) ---
+async def main():
+    # Telegram Bot Setup
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("नमस्ते! Form Number भेजें।")))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    
+    # FastAPI Server Setup
+    config = uvicorn.Config(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), loop="asyncio")
+    server = uvicorn.Server(config)
+    
+    print("🚀 Server and Bot are starting...")
+    await server.serve()
+
+if __name__ == "__main__":
+    asyncio.run(main())
     }
     try:
         doc = fitz.open(pdf_path)
